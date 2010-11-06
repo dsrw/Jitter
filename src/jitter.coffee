@@ -39,7 +39,6 @@
 
 fs=            require 'fs'
 path=          require 'path'
-optparse=      require './optparse'
 CoffeeScript=  require 'coffee-script'
 {exec}=        require 'child_process'
 {puts, print}= require 'sys'
@@ -59,105 +58,68 @@ BANNER= '''
   Usage:
     jitter coffee-path js-path [test-path]
         '''
-# Globals
-options= {}
-baseSource= baseTarget= baseTest= ''
-optionParser= null
-isWatched= {}
-testFiles= []
+  
+class Jitter
+  @compilers: {}
+  watchedFiles: {}
+  rootCompile: ->
+    [@changed, @compiled, @errors] = [[],[], {}]
+    @scanDir @source
+    q =>
+      if @changed.length > 0
+        if Object.keys(@errors).length is 0 then @onSuccess()
+        else @onError()
+  
+  scanDir: (directory) ->
+    for item in fs.readdirSync directory
+      sourcePath = "#{@source}/#{item}"
+      mtime = fs.statSync(sourcePath).mtime.valueOf()
+      continue if @watchedFiles[sourcePath] is mtime
+      if sourcePath.match @pattern
+        @watchedFiles[sourcePath] = mtime
+        @changed.push sourcePath
+        try
+          @compile sourcePath if @target
+          @onChange sourcePath
+        catch err
+          @errors[sourcePath] = err
+      else if fs.statSync(sourcePath).isDirectory()
+        @scanDir sourcePath
+        
+  onError: ->
+    puts "Error in #{name}:\n#{err.message}" for name,err of @errors
+  onChange: (file) ->
+    puts "Compiled #{file}"
+  onSuccess: ->
+    puts "finished."
 
-exports.run= ->
-  parseOptions()
-  return usage() unless baseTarget
-  compileScripts()
+class CoffeeCompiler extends Jitter
+  pattern: /\.coffee$/
+  compile: (file) -> 
+    code = fs.readFileSync(file).toString()
+    js = CoffeeScript.compile code, {file}
+    jsPath = file.replace(/^#{@source}/, @target).replace(/coffee$/, "js")
+    @compiled.push file
+    q exec, "mkdir -p #{path.dirname(jsPath)}", -> fs.writeFileSync jsPath, js
 
-compileScripts= ->
-  dirs= Source: baseSource, Target: baseTarget
-  dirs.Test= baseTest if baseTest
-  for name, dir of dirs 
-    q path.exists, dir, (exists) ->
-      unless exists
-        die "#{name} directory '#{dir}' does not exist."
-      else unless fs.statSync(dir).isDirectory()
-        die "#{name} '#{dir}' is a file; Jitter needs a directory."
-  q rootCompile
-  q runTests
-  q ->  
-    puts 'Watching for changes and new files. Press Ctrl+C to stop.'
-    setInterval rootCompile, 500
+Jitter.compilers["coffee"] = CoffeeCompiler
 
-compile= (source, target) ->
-  for item in fs.readdirSync source
-    sourcePath= "#{source}/#{item}"
-    continue if isWatched[sourcePath]
-    if path.extname(sourcePath) is '.coffee'
-      readScript sourcePath, target
-    else if fs.statSync(sourcePath).isDirectory()
-      compile sourcePath, target
-    
-rootCompile= ->
-  compile(baseSource, baseTarget)
-  compile(baseTest, baseTest) if baseTest
+exports.watch = watch = (opts) ->
+  class Watcher extends Jitter.compilers[opts.compiler or 'coffee']
+    constructor: (args) ->
+      (@[name] = func) for name, func of args
+      setInterval (=> @rootCompile()), 500
+  new Watcher(opts)
 
-readScript= (source, target) ->
-  compileScript(source, target)
-  puts 'Compiled '+ source
-  watchScript(source, target)
+load = (file) ->
+  eval CoffeeScript.compile(fs.readFileSync(file).toString(), fileName: file)
 
-watchScript= (source, target) ->
-  isWatched[source]= true
-  fs.watchFile source, persistent: true, interval: 250, (curr, prev) ->
-    return if curr.mtime.getTime() is prev.mtime.getTime()
-    compileScript(source, target)
-    puts 'Recompiled '+ source
-    q runTests
-
-compileScript= (source, target) ->
-  try
-    code= fs.readFileSync(source).toString()
-    js= CoffeeScript.compile code, {source}
-    writeJS source, js, target
-  catch err
-    puts err.message
-    notifyGrowl source, err.message
-
-writeJS= (source, js, target) ->
-  base= if target is baseTest then baseTest else baseSource
-  filename= path.basename(source, path.extname(source)) + '.js'
-  dir=      target + path.dirname(source).substring(base.length)
-  jsPath=  path.join dir, filename
-  q exec, "mkdir -p #{dir}", ->
-    fs.writeFileSync jsPath, js
-    testFiles.push jsPath if target is baseTest and jsPath not in testFiles 
-      
-notifyGrowl= (source, errMessage) ->
-  basename= source.replace(/^.*[\/\\]/, '')
-  if m= errMessage.match /Parse error on line (\d+)/
-    message= "Parse error in #{basename}\non line #{m[1]}."
-  else
-    message= "Error in #{basename}."
-  args= ['growlnotify', '-n', 'CoffeeScript', '-p', '2', '-t', "\"Compilation failed\"", '-m', "\"#{message}\""]
-  exec args.join(' ')
-
-runTests= ->
-  for test in testFiles
-    puts "running #{test}"
-    exec "node #{test}", (error, stdout, stderr) ->
-      print stdout
-      print stderr
-      notifyGrowl test, stderr if stderr
-
-parseOptions= ->
-  optionParser= new optparse.OptionParser [], BANNER
-  options=    optionParser.parse process.argv
-  [baseSource, baseTarget, baseTest]= options.arguments[arg] or '' for arg in [2..4]
-  if baseSource[-1] is '/' then baseSource= baseSource[0...-1]
-  if baseTarget[-1] is '/' then baseTarget= baseTarget[0...-1]
-
-usage= ->
-  puts optionParser.help()
-  process.exit 0
-
-die= (message) ->
-  puts message
-  process.exit 1
+exports.run = ->
+  args = process.argv[2...]
+  switch args.length
+    when 0
+      load 'build.jitter'
+    when 1
+      load "#{args[0]}.jitter"
+    when 2
+      watch source:args[0], target:args[1]
